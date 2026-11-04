@@ -25,14 +25,25 @@ There is **no hard-coded number of keys per provider**. Add as many authorized k
 - Dark purple React admin dashboard
 - Docker Compose deployment
 
-## Important limitations (current starter release)
+## Current capabilities
+- Username/password registration and sign-in with server-side sessions
+- Admin account provisioned from private `ADMIN_USERNAME` and `ADMIN_PASSWORD` environment variables
+- Admin-only user listing, disable/enable, role changes, account deletion, and request/token quota settings
+- User-specific saved conversations; administrators can inspect all conversations
+- Per-user usage tracking plus administrator-wide usage and recent request inspection
+- Admin management of provider definitions and API keys, including add/edit/disable/delete
+- Passwords are stored as PBKDF2 hashes; provider API secrets remain Fernet-encrypted
+- Admin UI and member chat UI share one authenticated application
+
+## Important limitations
 - Streaming/SSE is not implemented yet. Requests with `stream: true` are not streamed.
 - Token totals are based on upstream usage metadata. Provider quota/balance endpoints are not queried; rate-limit values appear only when the provider returns recognized response headers.
-- Custom providers currently need an OpenAI-compatible `/chat/completions` API. Anthropic/Gemini-specific adapters are available only for the built-in providers.
-- The dashboard is an **admin key-management console**, not yet a public multi-user chat service. Do not expose it to the public internet as-is.
-- User registration, individual API tokens, per-user quotas, abuse controls, billing, and public signup are planned next.
-- Cross-provider fallback is a basic attempt sequence; model identifiers and request parameters are not universally compatible between providers. Specify the provider and a model valid for that provider for reliable results.
-- SQLite is suitable for a single-instance starter deployment. Use PostgreSQL and coordinated key leasing before scaling horizontally.
+- Custom providers currently need an OpenAI-compatible `/chat/completions` API. Anthropic/Gemini-specific adapters are available only for built-in providers.
+- Per-user quotas are lifetime counters at this stage, not daily/monthly billing periods. A value of `0` means unlimited.
+- Public registration is currently enabled. Add CAPTCHA/email verification, IP-based rate limiting, abuse detection, and operational monitoring before opening signup widely.
+- The app has no payment/billing system. Never treat token counters as provider invoices.
+- Cross-provider fallback is a basic attempt sequence; model identifiers and request parameters are not universally compatible between providers. Specify the provider and a model valid for that provider.
+- SQLite is suitable for a single-instance deployment. Use PostgreSQL and coordinated key leasing before scaling horizontally.
 
 ## Billing and fair-use
 This router does not create free model capacity or bypass upstream rate limits. All usage is charged to the upstream API accounts whose keys you configure. Key rotation can distribute requests and recover from a limited key, but does not remove provider quotas, billing, or terms. Only use keys and accounts you are authorized to operate. To let many people chat, add per-user limits and abuse protection before making the service public.
@@ -46,14 +57,14 @@ This router does not create free model capacity or bypass upstream rate limits. 
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 
-3. Put that value in `MASTER_ENCRYPTION_KEY`. Set `ADMIN_API_KEY` to a random secret of at least 32 characters. Never commit `.env`.
+3. Put that value in `MASTER_ENCRYPTION_KEY`. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` privately in your host environment. The password must be at least 12 characters. Never commit `.env` or real credentials. The admin account is created automatically at startup from these variables.
 4. Start:
 
    ```bash
    docker compose up --build
    ```
 
-5. Open http://localhost:5173 and unlock the dashboard with `ADMIN_API_KEY`.
+5. Open http://localhost:5173 and sign in using the private admin username and password configured in your environment. New visitors can register member accounts.
 
 Health endpoint: http://localhost:8000/health
 
@@ -105,12 +116,13 @@ Content-Type: application/json
 Supported provider values: `openai`, `anthropic`, `gemini`, `deepseek`, `openrouter`. The model must exist for the chosen provider.
 
 ## Security checklist
-- Keep `.env`, provider keys, and the encryption master key out of Git.
+- Keep `.env`, provider keys, admin password, and encryption master key out of Git.
 - Back up `MASTER_ENCRYPTION_KEY`; without it stored keys cannot be decrypted.
 - Use HTTPS and restrict CORS in production.
-- Keep admin endpoints private. The admin secret is a bootstrap protection, not a complete multi-user identity system.
-- Before public launch, implement user authentication, per-user API tokens, rate limits, spending caps, abuse protection, and audit controls.
-- Do not promise unlimited usage: upstream provider quotas and billing always apply.
+- Use a unique, strong admin password and rotate it through the host environment. The admin account is provisioned from `ADMIN_USERNAME` and `ADMIN_PASSWORD`.
+- Public registration is enabled in this starter. Add CAPTCHA/email verification, rate limiting, abuse detection, and backups before public launch.
+- Quotas are lifetime totals in this version; 0 means unlimited. Provider account quotas and billing still apply.
+- Do not promise unlimited model usage: upstream provider quotas and billing always apply.
 
 ## Local development
 
