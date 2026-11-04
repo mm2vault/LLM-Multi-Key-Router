@@ -197,6 +197,27 @@ async def require_admin(
             return user
     raise HTTPException(403, "Administrator access required")
 
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=12, max_length=256)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class UserUpdate(BaseModel):
+    status: str | None = None
+    role: str | None = None
+    quota_requests: int | None = None
+    quota_tokens: int | None = None
+
+class ConversationCreate(BaseModel):
+    title: str = Field(default="New conversation", min_length=1, max_length=120)
+
+class MessageCreate(BaseModel):
+    role: str
+    content: str = Field(min_length=1, max_length=100000)
+
 @app.post("/auth/register")
 async def register(body: "RegisterRequest"):
     username = body.username.strip()
@@ -349,27 +370,6 @@ async def save_message(conversation_id: str, body: "MessageCreate", user: dict =
         await conn.execute("UPDATE conversations SET updated_at=? WHERE id=?",(time.time(),conversation_id))
         await conn.commit()
     return {"saved": True}
-
-class RegisterRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=32)
-    password: str = Field(min_length=12, max_length=256)
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class UserUpdate(BaseModel):
-    status: str | None = None
-    role: str | None = None
-    quota_requests: int | None = None
-    quota_tokens: int | None = None
-
-class ConversationCreate(BaseModel):
-    title: str = Field(default="New conversation", min_length=1, max_length=120)
-
-class MessageCreate(BaseModel):
-    role: str
-    content: str = Field(min_length=1, max_length=100000)
 
 class KeyCreate(BaseModel):
     provider: str
