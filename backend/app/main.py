@@ -137,10 +137,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     if ADMIN_USERNAME and ADMIN_PASSWORD:
         async with aiosqlite.connect(DB_PATH) as conn:
-            row = await (await conn.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,))).fetchone()
+            row = await (await conn.execute("SELECT id,password_hash FROM users WHERE username=?", (ADMIN_USERNAME,))).fetchone()
             if row:
-                await conn.execute("UPDATE users SET password_hash=?,role='admin',status='active' WHERE username=?",
-                    (password_hash(ADMIN_PASSWORD), ADMIN_USERNAME))
+                if not verify_password(ADMIN_PASSWORD, row[1]):
+                    await conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                        (password_hash(ADMIN_PASSWORD), row[0]))
+                    await conn.execute("DELETE FROM sessions WHERE user_id=?", (row[0],))
+                await conn.execute("UPDATE users SET role='admin',status='active' WHERE id=?", (row[0],))
             else:
                 await conn.execute("""INSERT INTO users
                     (id,username,password_hash,role,status,quota_requests,quota_tokens,created_at)
@@ -775,6 +778,12 @@ async def chat(body: ChatRequest, user: dict = Depends(current_user)):
     async with aiosqlite.connect(DB_PATH) as conn:
         request_count = (await (await conn.execute("SELECT COUNT(*) FROM usage WHERE user_id=?",(user["id"],))).fetchone())[0]
         token_count = (await (await conn.execute("SELECT COALESCE(SUM(total_tokens),0) FROM usage WHERE user_id=?",(user["id"],))).fetchone())[0]
+    async with aiosqlite.connect(DB_PATH) as conn:
+        recent_count = (await (await conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE user_id=? AND created_at>=?",
+            (user["id"], time.time() - 60))).fetchone())[0]
+    if recent_count >= 30:
+        raise HTTPException(429, "Rate limit reached. Please wait a minute before trying again.")
     if user["quota_requests"] and request_count >= user["quota_requests"]:
         raise HTTPException(429, "Your request quota has been reached. Contact an administrator.")
     if user["quota_tokens"] and token_count >= user["quota_tokens"]:
