@@ -70,40 +70,61 @@ Health endpoint: http://localhost:8000/health
 
 ## API
 
+Register a member account:
+
+```http
+POST /auth/register
+Content-Type: application/json
+
+{"username":"member01","password":"a-long-unique-password"}
+```
+
+Sign in (the configured admin account uses the same endpoint):
+
+```http
+POST /auth/login
+Content-Type: application/json
+
+{"username":"your-admin-username","password":"your-private-admin-password"}
+```
+
+The response returns a bearer `token`. Use it for authenticated requests. Admin-only routes require an administrator session.
+
 Add a custom OpenAI-compatible provider (admin only):
 
 ```http
 POST /admin/providers
-X-Admin-Key: <ADMIN_API_KEY>
+Authorization: Bearer <SESSION_TOKEN>
 Content-Type: application/json
 
 {"name":"My Gateway","base_url":"https://api.example.com/v1"}
 ```
 
-The response includes a provider slug. Add a key for that slug using the endpoint below:
+The response includes a provider slug. Add a key for that slug:
 
 ```http
 POST /admin/keys
-X-Admin-Key: <ADMIN_API_KEY>
+Authorization: Bearer <SESSION_TOKEN>
 Content-Type: application/json
 
 {"provider":"my-gateway","label":"My Gateway key 01","api_key":"<YOUR_PROVIDER_KEY>"}
 ```
 
-Add a built-in provider key (admin only):
+Set a user's quotas (0 means unlimited lifetime usage):
 
 ```http
-POST /admin/keys
-X-Admin-Key: <ADMIN_API_KEY>
+PATCH /admin/users/<USER_ID>
+Authorization: Bearer <ADMIN_SESSION_TOKEN>
 Content-Type: application/json
 
-{"provider":"openai","label":"Primary OpenAI","api_key":"<YOUR_PROVIDER_KEY>"}
+{"quota_requests":1000,"quota_tokens":250000}
 ```
 
 Chat:
 
 ```http
 POST /v1/chat/completions
+Authorization: Bearer <SESSION_TOKEN>
 Content-Type: application/json
 
 {
@@ -113,7 +134,7 @@ Content-Type: application/json
 }
 ```
 
-Supported provider values: `openai`, `anthropic`, `gemini`, `deepseek`, `openrouter`. The model must exist for the chosen provider.
+Provider usage totals are recorded from provider response metadata. The model must exist for the chosen provider.
 
 ## Security checklist
 - Keep `.env`, provider keys, admin password, and encryption master key out of Git.
