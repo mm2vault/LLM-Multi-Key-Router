@@ -64,7 +64,8 @@ async def init_db() -> None:
           id TEXT PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL,
           secret TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
           cooldown_until REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
-          successes INTEGER NOT NULL DEFAULT 0, last_used REAL, created_at REAL NOT NULL
+          successes INTEGER NOT NULL DEFAULT 0, last_used REAL, created_at REAL NOT NULL,
+          limit_info TEXT NOT NULL DEFAULT '{}'
         )""")
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS usage (
@@ -78,6 +79,9 @@ async def init_db() -> None:
           base_url TEXT NOT NULL, created_at REAL NOT NULL
         )""")
         # Safe additive migrations for databases created by earlier versions.
+        key_columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(api_keys)")).fetchall()}
+        if "limit_info" not in key_columns:
+            await conn.execute("ALTER TABLE api_keys ADD COLUMN limit_info TEXT NOT NULL DEFAULT '{}'")
         columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(usage)")).fetchall()}
         for name in ("input_tokens", "output_tokens", "total_tokens"):
             if name not in columns:
@@ -150,12 +154,18 @@ async def get_candidates(provider: str):
             (provider, time.time()))
         return [dict(row) for row in await cur.fetchall()]
 
-async def mark_key(key_id: str, ok: bool, cooldown: int = 0):
+async def mark_key(key_id: str, ok: bool, cooldown: int = 0, headers=None):
+    headers = headers or {}
+    names = ("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests",
+             "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens",
+             "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+             "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining")
+    limits = {name: headers.get(name) for name in names if headers.get(name) is not None}
     async with aiosqlite.connect(DB_PATH) as conn:
         if ok:
-            await conn.execute("UPDATE api_keys SET successes=successes+1, failures=0, last_used=?, cooldown_until=0 WHERE id=?", (time.time(), key_id))
+            await conn.execute("UPDATE api_keys SET successes=successes+1, failures=0, last_used=?, cooldown_until=0, limit_info=? WHERE id=?", (time.time(), json.dumps(limits), key_id))
         else:
-            await conn.execute("UPDATE api_keys SET failures=failures+1, last_used=?, cooldown_until=? WHERE id=?", (time.time(), time.time()+cooldown, key_id))
+            await conn.execute("UPDATE api_keys SET failures=failures+1, last_used=?, cooldown_until=?, limit_info=? WHERE id=?", (time.time(), time.time()+cooldown, json.dumps(limits), key_id))
         await conn.commit()
 
 async def provider_order(requested: str | None):
@@ -307,13 +317,17 @@ async def add_key(body: KeyCreate):
 async def list_keys():
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
-        cur = await conn.execute("SELECT id,provider,label,secret,enabled,cooldown_until,failures,successes,last_used,created_at FROM api_keys ORDER BY created_at DESC")
+        cur = await conn.execute("SELECT id,provider,label,secret,enabled,cooldown_until,failures,successes,last_used,created_at,limit_info FROM api_keys ORDER BY created_at DESC")
         rows = [dict(r) for r in await cur.fetchall()]
     result = []
     for row in rows:
         secret = decrypt(row.pop("secret"))
         row["masked_key"] = mask_secret(secret)
         row["cooling_down"] = row["cooldown_until"] > time.time()
+        try:
+            row["limit_info"] = json.loads(row["limit_info"] or "{}")
+        except json.JSONDecodeError:
+            row["limit_info"] = {}
         result.append(row)
     return {"keys": result}
 
@@ -374,14 +388,14 @@ async def chat(body: ChatRequest):
                 latency = int((time.perf_counter()-started)*1000)
                 if upstream.is_success:
                     data = normalize_response(provider, upstream.json(), body.model)
-                    await mark_key(row["id"], True)
+                    await mark_key(row["id"], True, headers=upstream.headers)
                     await log_usage(provider, body.model, row["id"], latency, True, upstream.status_code, data.get("usage", {}))
                     data.setdefault("router", {"provider": provider, "key_id": row["id"], "latency_ms": latency})
                     return JSONResponse(data)
                 status = upstream.status_code
                 detail = upstream.text[:1000]
                 cooldown = int(upstream.headers.get("retry-after", COOLDOWN)) if status == 429 else (COOLDOWN*5 if status in (401,403) else min(COOLDOWN, 20))
-                await mark_key(row["id"], False, cooldown)
+                await mark_key(row["id"], False, cooldown, upstream.headers)
                 await log_usage(provider, body.model, row["id"], latency, False, status)
                 errors.append({"provider": provider, "status": status, "detail": detail})
                     if status in (400, 404, 422):
