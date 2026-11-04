@@ -344,10 +344,10 @@ async def stats():
         calls = (await (await conn.execute("SELECT COUNT(*) FROM usage")).fetchone())[0]
         failed = (await (await conn.execute("SELECT COUNT(*) FROM usage WHERE success=0")).fetchone())[0]
         by_provider = await (await conn.execute("SELECT provider,COUNT(*) FROM usage GROUP BY provider")).fetchall()
-    token_row = await (await conn.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage")).fetchone()
-    by_key = await (await conn.execute("""SELECT a.id,a.label,a.provider,a.enabled,a.successes,a.failures,
-        COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.output_tokens),0),COALESCE(SUM(u.total_tokens),0),
-        COUNT(u.id) FROM api_keys a LEFT JOIN usage u ON u.key_id=a.id GROUP BY a.id ORDER BY a.created_at DESC""")).fetchall()
+        token_row = await (await conn.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage")).fetchone()
+        by_key = await (await conn.execute("""SELECT a.id,a.label,a.provider,a.enabled,a.successes,a.failures,
+            COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.output_tokens),0),COALESCE(SUM(u.total_tokens),0),
+            COUNT(u.id) FROM api_keys a LEFT JOIN usage u ON u.key_id=a.id GROUP BY a.id ORDER BY a.created_at DESC""")).fetchall()
     return {"total_keys": total, "enabled_keys": enabled, "requests": calls, "failed_requests": failed,
             "input_tokens": token_row[0], "output_tokens": token_row[1], "total_tokens": token_row[2],
             "providers": {r[0]: r[1] for r in by_provider},
