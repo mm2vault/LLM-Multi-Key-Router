@@ -7,6 +7,9 @@ import os
 import random
 import time
 import uuid
+import hashlib
+import hmac
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,11 @@ load_dotenv()
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = os.getenv("DATABASE_PATH", str(ROOT / "data" / "router.db"))
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SESSION_DAYS = max(1, int(os.getenv("SESSION_DAYS", "14")))
+DEFAULT_USER_REQUEST_LIMIT = max(0, int(os.getenv("DEFAULT_USER_REQUEST_LIMIT", "0")))
+DEFAULT_USER_TOKEN_LIMIT = max(0, int(os.getenv("DEFAULT_USER_TOKEN_LIMIT", "0")))
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "90"))
 MAX_ATTEMPTS = max(1, int(os.getenv("MAX_KEY_ATTEMPTS", "20")))
 COOLDOWN = max(5, int(os.getenv("COOLDOWN_SECONDS", "60")))
@@ -78,20 +86,43 @@ async def init_db() -> None:
           id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL,
           base_url TEXT NOT NULL, created_at REAL NOT NULL
         )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active',
+          quota_requests INTEGER NOT NULL DEFAULT 0, quota_tokens INTEGER NOT NULL DEFAULT 0,
+          created_at REAL NOT NULL
+        )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at REAL NOT NULL,
+          created_at REAL NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL
+        )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+          content TEXT NOT NULL, created_at REAL NOT NULL,
+          FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )""")
         # Safe additive migrations for databases created by earlier versions.
         key_columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(api_keys)")).fetchall()}
         if "limit_info" not in key_columns:
             await conn.execute("ALTER TABLE api_keys ADD COLUMN limit_info TEXT NOT NULL DEFAULT '{}'")
         columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(usage)")).fetchall()}
-        for name in ("input_tokens", "output_tokens", "total_tokens"):
+        for name in ("input_tokens", "output_tokens", "total_tokens", "user_id"):
             if name not in columns:
                 await conn.execute(f"ALTER TABLE usage ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
         await conn.commit()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if len(ADMIN_API_KEY) < 32:
-        raise RuntimeError("Set ADMIN_API_KEY to a random secret with at least 32 characters.")
+    if len(ADMIN_API_KEY) < 32 and (not ADMIN_USERNAME or len(ADMIN_PASSWORD) < 12):
+        raise RuntimeError("Set ADMIN_API_KEY (32+ chars) or ADMIN_USERNAME and ADMIN_PASSWORD (12+ chars).")
     get_cipher()
     await init_db()
     yield
