@@ -598,6 +598,63 @@ async def list_keys():
         result.append(row)
     return {"keys": result}
 
+class KeyUpdate(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=100)
+    api_key: str | None = Field(default=None, min_length=8)
+
+@app.patch("/admin/keys/{key_id}", dependencies=[Depends(require_admin)])
+async def update_key(key_id: str, body: KeyUpdate):
+    updates, values = [], []
+    if body.label is not None:
+        updates.append("label=?"); values.append(body.label)
+    if body.api_key is not None:
+        updates.append("secret=?"); values.append(encrypt(body.api_key))
+    if not updates:
+        raise HTTPException(400, "Provide a new label or API key")
+    values.append(key_id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("UPDATE api_keys SET "+", ".join(updates)+" WHERE id=?", values)
+        await conn.commit()
+    if not cur.rowcount:
+        raise HTTPException(404, "API key not found")
+    return {"updated": True, "id": key_id}
+
+class ProviderUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=60)
+    base_url: str | None = Field(default=None, min_length=12, max_length=300)
+
+@app.patch("/admin/providers/{provider_id}", dependencies=[Depends(require_admin)])
+async def update_provider(provider_id: str, body: ProviderUpdate):
+    updates, values = [], []
+    if body.name is not None:
+        updates.append("name=?"); values.append(body.name)
+    if body.base_url is not None:
+        from urllib.parse import urlparse
+        parsed = urlparse(body.base_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise HTTPException(400, "Custom provider URL must be HTTPS")
+        updates.append("base_url=?"); values.append(body.base_url.rstrip("/"))
+    if not updates:
+        raise HTTPException(400, "No changes supplied")
+    values.append(provider_id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("UPDATE custom_providers SET "+", ".join(updates)+" WHERE id=?", values)
+        await conn.commit()
+    if not cur.rowcount:
+        raise HTTPException(404, "Provider not found")
+    return {"updated": True}
+
+@app.get("/usage/me")
+async def my_usage(user: dict = Depends(current_user)):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        row = await (await conn.execute("""SELECT COUNT(*),COALESCE(SUM(input_tokens),0),
+            COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0),
+            SUM(CASE WHEN success=0 THEN 1 ELSE 0 END)
+            FROM usage WHERE user_id=?""",(user["id"],))).fetchone()
+    return {"requests": row[0] or 0, "input_tokens": row[1] or 0, "output_tokens": row[2] or 0,
+            "total_tokens": row[3] or 0, "failed_requests": row[4] or 0,
+            "quota_requests": user["quota_requests"], "quota_tokens": user["quota_tokens"]}
+
 @app.delete("/admin/keys/{key_id}", dependencies=[Depends(require_admin)])
 async def delete_key(key_id: str):
     async with aiosqlite.connect(DB_PATH) as conn:
