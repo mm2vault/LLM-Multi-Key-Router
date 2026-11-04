@@ -308,6 +308,9 @@ async def delete_user(user_id: str):
             if count <= 1:
                 raise HTTPException(400, "Cannot delete the last active administrator")
         await conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await conn.execute("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id=?)", (user_id,))
+        await conn.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
+        await conn.execute("UPDATE usage SET user_id=NULL WHERE user_id=?", (user_id,))
         await conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         await conn.commit()
     return {"deleted": True}
@@ -530,6 +533,12 @@ def normalize_response(provider: str, data: dict, requested_model: str):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "LLM Multi-Key Router", "providers": list(PROVIDERS)}
+
+@app.get("/v1/providers")
+async def public_providers():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        rows = await (await conn.execute("SELECT DISTINCT provider FROM api_keys WHERE enabled=1 ORDER BY provider")).fetchall()
+    return {"providers": [row[0] for row in rows]}
 
 @app.get("/v1/models")
 async def models():
