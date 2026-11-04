@@ -314,6 +314,16 @@ async def update_user(user_id: str, body: UserUpdate):
         raise HTTPException(400, "No changes supplied")
     values.append(user_id)
     async with aiosqlite.connect(DB_PATH) as conn:
+        current = await (await conn.execute("SELECT role,status FROM users WHERE id=?", (user_id,))).fetchone()
+        if not current:
+            raise HTTPException(404, "User not found")
+        is_last_admin = current[0] == "admin" and current[1] == "active" and (
+            (body.role is not None and body.role != "admin") or
+            (body.status is not None and body.status != "active"))
+        if is_last_admin:
+            active_admins = (await (await conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'")).fetchone())[0]
+            if active_admins <= 1:
+                raise HTTPException(400, "Cannot disable or demote the last active administrator")
         cur = await conn.execute("UPDATE users SET "+", ".join(updates)+" WHERE id=?", values)
         await conn.commit()
     if not cur.rowcount:
@@ -770,6 +780,10 @@ async def chat(body: ChatRequest, user: dict = Depends(current_user)):
     if user["quota_tokens"] and token_count >= user["quota_tokens"]:
         raise HTTPException(429, "Your token quota has been reached. Contact an administrator.")
     payload = body.model_dump(exclude_none=True)
+    if user["quota_tokens"]:
+        remaining = max(1, user["quota_tokens"] - token_count)
+        requested_output = payload.get("max_tokens") or 1024
+        payload["max_tokens"] = min(requested_output, remaining)
     errors = []
     attempts = 0
     for provider in await provider_order(body.provider):
