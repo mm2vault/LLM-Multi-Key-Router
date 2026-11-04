@@ -72,6 +72,16 @@ async def init_db() -> None:
           key_id TEXT, latency_ms INTEGER NOT NULL, success INTEGER NOT NULL,
           status_code INTEGER, created_at REAL NOT NULL
         )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS custom_providers (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL,
+          base_url TEXT NOT NULL, created_at REAL NOT NULL
+        )""")
+        # Safe additive migrations for databases created by earlier versions.
+        columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(usage)")).fetchall()}
+        for name in ("input_tokens", "output_tokens", "total_tokens"):
+            if name not in columns:
+                await conn.execute(f"ALTER TABLE usage ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
         await conn.commit()
 
 @asynccontextmanager
@@ -106,11 +116,31 @@ class ChatRequest(BaseModel):
 def mask_secret(secret: str) -> str:
     return "••••••••" + secret[-4:]
 
-async def log_usage(provider: str, model: str, key_id: str | None, latency: int, success: bool, status: int | None):
+async def log_usage(provider: str, model: str, key_id: str | None, latency: int, success: bool, status: int | None, usage: dict | None = None):
+    usage = usage or {}
+    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or usage.get("promptTokenCount") or 0)
+    output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or usage.get("candidatesTokenCount") or 0)
+    total_tokens = int(usage.get("total_tokens") or usage.get("totalTokenCount") or (input_tokens + output_tokens))
     async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("INSERT INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), provider, model, key_id, latency, int(success), status, time.time()))
+        await conn.execute("""INSERT INTO usage
+          (id,provider,model,key_id,latency_ms,success,status_code,created_at,input_tokens,output_tokens,total_tokens)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), provider, model, key_id, latency, int(success), status, time.time(),
+             input_tokens, output_tokens, total_tokens))
         await conn.commit()
+
+async def provider_config(provider: str) -> dict | None:
+    if provider in PROVIDERS:
+        return PROVIDERS[provider]
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute("SELECT slug,base_url FROM custom_providers WHERE slug=?", (provider,))).fetchone()
+    return {"base": row["base_url"].rstrip("/"), "kind": "openai"} if row else None
+
+async def all_provider_ids() -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        rows = await (await conn.execute("SELECT slug FROM custom_providers ORDER BY name")).fetchall()
+    return list(PROVIDERS) + [row[0] for row in rows]
 
 async def get_candidates(provider: str):
     async with aiosqlite.connect(DB_PATH) as conn:
@@ -128,15 +158,19 @@ async def mark_key(key_id: str, ok: bool, cooldown: int = 0):
             await conn.execute("UPDATE api_keys SET failures=failures+1, last_used=?, cooldown_until=? WHERE id=?", (time.time(), time.time()+cooldown, key_id))
         await conn.commit()
 
-def provider_order(requested: str | None):
+async def provider_order(requested: str | None):
+    available = await all_provider_ids()
     if requested:
-        if requested not in PROVIDERS:
+        if requested not in available:
             raise HTTPException(400, f"Unsupported provider: {requested}")
-        return [requested] + [p for p in PROVIDERS if p != requested]
-    return list(PROVIDERS)
+        return [requested] + [p for p in available if p != requested]
+    return available
 
 async def call_openai_compatible(provider: str, key: str, payload: dict):
-    base = PROVIDERS[provider]["base"]
+    config = await provider_config(provider)
+    if not config:
+        raise HTTPException(400, f"Unknown provider: {provider}")
+    base = config["base"]
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         response = await client.post(f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -182,7 +216,10 @@ async def call_gemini(key: str, payload: dict):
             headers={"content-type": "application/json"}, json=body)
 
 async def execute_provider(provider: str, key: str, payload: dict):
-    if PROVIDERS[provider]["kind"] == "anthropic":
+    config = await provider_config(provider)
+    if not config:
+        raise HTTPException(400, f"Unknown provider: {provider}")
+    if config["kind"] == "anthropic":
         return await call_anthropic(key, payload)
     if PROVIDERS[provider]["kind"] == "gemini":
         return await call_gemini(key, payload)
@@ -210,12 +247,55 @@ async def health():
 
 @app.get("/v1/models")
 async def models():
-    return {"object": "list", "data": [{"id": f"{p}:<model-name>", "object": "model", "owned_by": p} for p in PROVIDERS]}
+    providers = await all_provider_ids()
+    return {"object": "list", "data": [{"id": f"{p}:<model-name>", "object": "model", "owned_by": p} for p in providers]}
+
+class CustomProviderCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+    base_url: str = Field(min_length=12, max_length=300)
+
+@app.post("/admin/providers", dependencies=[Depends(require_admin)])
+async def add_custom_provider(body: CustomProviderCreate):
+    from urllib.parse import urlparse
+    parsed = urlparse(body.base_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise HTTPException(400, "Custom provider URL must be a valid HTTPS URL.")
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in body.name).strip("-")
+    slug = "-".join(part for part in slug.split("-") if part)
+    if not slug or slug in PROVIDERS:
+        raise HTTPException(400, "Provider name conflicts with a built-in provider.")
+    provider_id = str(uuid.uuid4())
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute("INSERT INTO custom_providers (id,name,slug,base_url,created_at) VALUES (?,?,?,?,?)",
+                (provider_id, body.name, slug, body.base_url.rstrip("/"), time.time()))
+            await conn.commit()
+    except aiosqlite.IntegrityError:
+        raise HTTPException(409, "A provider with this name already exists.")
+    return {"id": provider_id, "name": body.name, "provider": slug, "base_url": body.base_url}
+
+@app.get("/admin/providers", dependencies=[Depends(require_admin)])
+async def list_custom_providers():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute("SELECT id,name,slug,base_url,created_at FROM custom_providers ORDER BY name")).fetchall()
+    return {"providers": [dict(row) for row in rows]}
+
+@app.delete("/admin/providers/{provider_id}", dependencies=[Depends(require_admin)])
+async def delete_custom_provider(provider_id: str):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        row = await (await conn.execute("SELECT slug FROM custom_providers WHERE id=?", (provider_id,))).fetchone()
+        if not row:
+            raise HTTPException(404, "Provider not found")
+        await conn.execute("DELETE FROM api_keys WHERE provider=?", (row[0],))
+        await conn.execute("DELETE FROM custom_providers WHERE id=?", (provider_id,))
+        await conn.commit()
+    return {"deleted": True}
 
 @app.post("/admin/keys", dependencies=[Depends(require_admin)])
 async def add_key(body: KeyCreate):
-    if body.provider not in PROVIDERS:
-        raise HTTPException(400, "Unsupported provider")
+    if not await provider_config(body.provider):
+        raise HTTPException(400, "Unsupported provider. Add a custom OpenAI-compatible provider first if needed.")
     key_id = str(uuid.uuid4())
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("INSERT INTO api_keys (id,provider,label,secret,created_at) VALUES (?,?,?,?,?)",
@@ -264,8 +344,15 @@ async def stats():
         calls = (await (await conn.execute("SELECT COUNT(*) FROM usage")).fetchone())[0]
         failed = (await (await conn.execute("SELECT COUNT(*) FROM usage WHERE success=0")).fetchone())[0]
         by_provider = await (await conn.execute("SELECT provider,COUNT(*) FROM usage GROUP BY provider")).fetchall()
+    token_row = await (await conn.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage")).fetchone()
+    by_key = await (await conn.execute("""SELECT a.id,a.label,a.provider,a.enabled,a.successes,a.failures,
+        COALESCE(SUM(u.input_tokens),0),COALESCE(SUM(u.output_tokens),0),COALESCE(SUM(u.total_tokens),0),
+        COUNT(u.id) FROM api_keys a LEFT JOIN usage u ON u.key_id=a.id GROUP BY a.id ORDER BY a.created_at DESC""")).fetchall()
     return {"total_keys": total, "enabled_keys": enabled, "requests": calls, "failed_requests": failed,
-            "providers": {r[0]: r[1] for r in by_provider}}
+            "input_tokens": token_row[0], "output_tokens": token_row[1], "total_tokens": token_row[2],
+            "providers": {r[0]: r[1] for r in by_provider},
+            "keys_usage": [{"id":r[0],"label":r[1],"provider":r[2],"enabled":bool(r[3]),"successes":r[4],"failures":r[5],
+                "input_tokens":r[6],"output_tokens":r[7],"total_tokens":r[8],"requests":r[9]} for r in by_key]}
 
 @app.post("/v1/chat/completions")
 async def chat(body: ChatRequest):
@@ -274,7 +361,7 @@ async def chat(body: ChatRequest):
     payload = body.model_dump(exclude_none=True)
     errors = []
     attempts = 0
-    for provider in provider_order(body.provider):
+    for provider in await provider_order(body.provider):
         candidates = await get_candidates(provider)
         for row in candidates:
             if attempts >= MAX_ATTEMPTS:
@@ -288,7 +375,7 @@ async def chat(body: ChatRequest):
                 if upstream.is_success:
                     data = normalize_response(provider, upstream.json(), body.model)
                     await mark_key(row["id"], True)
-                    await log_usage(provider, body.model, row["id"], latency, True, upstream.status_code)
+                    await log_usage(provider, body.model, row["id"], latency, True, upstream.status_code, data.get("usage", {}))
                     data.setdefault("router", {"provider": provider, "key_id": row["id"], "latency_ms": latency})
                     return JSONResponse(data)
                 status = upstream.status_code
@@ -297,7 +384,7 @@ async def chat(body: ChatRequest):
                 await mark_key(row["id"], False, cooldown)
                 await log_usage(provider, body.model, row["id"], latency, False, status)
                 errors.append({"provider": provider, "status": status, "detail": detail})
-                if status in (400, 404, 422):
+                    if status in (400, 404, 422):
                     raise HTTPException(status, detail)
             except HTTPException:
                 raise
