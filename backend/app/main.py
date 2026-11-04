@@ -79,7 +79,9 @@ async def init_db() -> None:
         CREATE TABLE IF NOT EXISTS usage (
           id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
           key_id TEXT, latency_ms INTEGER NOT NULL, success INTEGER NOT NULL,
-          status_code INTEGER, created_at REAL NOT NULL
+          status_code INTEGER, created_at REAL NOT NULL,
+          input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0, user_id TEXT
         )""")
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS custom_providers (
@@ -114,9 +116,12 @@ async def init_db() -> None:
         if "limit_info" not in key_columns:
             await conn.execute("ALTER TABLE api_keys ADD COLUMN limit_info TEXT NOT NULL DEFAULT '{}'")
         columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(usage)")).fetchall()}
-        for name in ("input_tokens", "output_tokens", "total_tokens", "user_id"):
+        for name in ("input_tokens", "output_tokens", "total_tokens"):
             if name not in columns:
                 await conn.execute(f"ALTER TABLE usage ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        if "user_id" not in columns:
+            await conn.execute("ALTER TABLE usage ADD COLUMN user_id TEXT")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user_id ON usage(user_id)")
         await conn.commit()
 
 @asynccontextmanager
