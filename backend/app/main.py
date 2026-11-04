@@ -636,9 +636,16 @@ async def stats():
                 "input_tokens":r[6],"output_tokens":r[7],"total_tokens":r[8],"requests":r[9]} for r in by_key]}
 
 @app.post("/v1/chat/completions")
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest, user: dict = Depends(current_user)):
     if not body.messages:
         raise HTTPException(400, "messages cannot be empty")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        request_count = (await (await conn.execute("SELECT COUNT(*) FROM usage WHERE user_id=?",(user["id"],))).fetchone())[0]
+        token_count = (await (await conn.execute("SELECT COALESCE(SUM(total_tokens),0) FROM usage WHERE user_id=?",(user["id"],))).fetchone())[0]
+    if user["quota_requests"] and request_count >= user["quota_requests"]:
+        raise HTTPException(429, "Your request quota has been reached. Contact an administrator.")
+    if user["quota_tokens"] and token_count >= user["quota_tokens"]:
+        raise HTTPException(429, "Your token quota has been reached. Contact an administrator.")
     payload = body.model_dump(exclude_none=True)
     errors = []
     attempts = 0
@@ -656,23 +663,23 @@ async def chat(body: ChatRequest):
                 if upstream.is_success:
                     data = normalize_response(provider, upstream.json(), body.model)
                     await mark_key(row["id"], True, headers=upstream.headers)
-                    await log_usage(provider, body.model, row["id"], latency, True, upstream.status_code, data.get("usage", {}))
+                    await log_usage(provider, body.model, row["id"], latency, True, upstream.status_code, data.get("usage", {}), user["id"])
                     data.setdefault("router", {"provider": provider, "key_id": row["id"], "latency_ms": latency})
                     return JSONResponse(data)
                 status = upstream.status_code
                 detail = upstream.text[:1000]
                 cooldown = int(upstream.headers.get("retry-after", COOLDOWN)) if status == 429 else (COOLDOWN*5 if status in (401,403) else min(COOLDOWN, 20))
                 await mark_key(row["id"], False, cooldown, upstream.headers)
-                await log_usage(provider, body.model, row["id"], latency, False, status)
+                await log_usage(provider, body.model, row["id"], latency, False, status, user_id=user["id"])
                 errors.append({"provider": provider, "status": status, "detail": detail})
-                    if status in (400, 404, 422):
+                if status in (400, 404, 422):
                     raise HTTPException(status, detail)
             except HTTPException:
                 raise
             except (httpx.TimeoutException, httpx.NetworkError, RuntimeError, ValueError) as exc:
                 latency = int((time.perf_counter()-started)*1000)
                 await mark_key(row["id"], False, COOLDOWN)
-                await log_usage(provider, body.model, row["id"], latency, False, None)
+                await log_usage(provider, body.model, row["id"], latency, False, None, user_id=user["id"])
                 errors.append({"provider": provider, "error": str(exc)[:300]})
                 continue
         if attempts >= MAX_ATTEMPTS:
