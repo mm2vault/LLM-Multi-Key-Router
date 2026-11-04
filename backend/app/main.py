@@ -131,9 +131,237 @@ app = FastAPI(title="LLM Multi-Key Router", version="0.1.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+def password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+    return "pbkdf2_sha256$310000$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, rounds, salt_text, digest_text = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_text.encode())
+        expected = base64.urlsafe_b64decode(digest_text.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(rounds))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+async def issue_session(user_id: str) -> str:
+    token = secrets.token_urlsafe(48)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("INSERT INTO sessions (token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)",
+            (token_digest(token), user_id, time.time() + SESSION_DAYS * 86400, time.time()))
+        await conn.commit()
+    return token
+
+async def current_user(authorization: str | None = Header(default=None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Sign in required")
+    token = authorization[7:].strip()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute("""SELECT u.id,u.username,u.role,u.status,u.quota_requests,u.quota_tokens,s.expires_at
+            FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?""", (token_digest(token),))).fetchone()
+    if not row or row["expires_at"] < time.time():
+        raise HTTPException(401, "Session expired. Sign in again.")
+    if row["status"] != "active":
+        raise HTTPException(403, "Account is disabled")
+    return dict(row)
+
+async def require_admin(
+    x_admin_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None)
+):
+    if x_admin_key and ADMIN_API_KEY and hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "username": ADMIN_USERNAME or "legacy-admin"}
+    if authorization and authorization.startswith("Bearer "):
+        user = await current_user(authorization)
+        if user["role"] == "admin":
+            return user
+    raise HTTPException(403, "Administrator access required")
+
+@app.post("/auth/register")
+async def register(body: "RegisterRequest"):
+    username = body.username.strip()
+    if not username.replace("_", "").replace("-", "").isalnum() or len(username) < 3 or len(username) > 32:
+        raise HTTPException(400, "Username must be 3-32 characters (letters, numbers, _ or -).")
+    if len(body.password) < 12:
+        raise HTTPException(400, "Password must contain at least 12 characters.")
+    user_id = str(uuid.uuid4())
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute("""INSERT INTO users
+                (id,username,password_hash,role,status,quota_requests,quota_tokens,created_at)
+                VALUES (?,?,?,'user','active',?,?,?)""",
+                (user_id, username, password_hash(body.password), DEFAULT_USER_REQUEST_LIMIT,
+                 DEFAULT_USER_TOKEN_LIMIT, time.time()))
+            await conn.commit()
+    except aiosqlite.IntegrityError:
+        raise HTTPException(409, "Username already exists")
+    token = await issue_session(user_id)
+    return {"token": token, "user": {"id": user_id, "username": username, "role": "user"}}
+
+@app.post("/auth/login")
+async def login(body: "LoginRequest"):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute("SELECT * FROM users WHERE username=?", (body.username.strip(),))).fetchone()
+    if not row or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid username or password")
+    if row["status"] != "active":
+        raise HTTPException(403, "Account is disabled")
+    token = await issue_session(row["id"])
+    return {"token": token, "user": {"id": row["id"], "username": row["username"], "role": row["role"]}}
+
+@app.get("/auth/me")
+async def me(user: dict = Depends(current_user)):
+    return {"user": {k: user[k] for k in ("id","username","role","status","quota_requests","quota_tokens")}}
+
+@app.post("/auth/logout")
+async def logout(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"logged_out": True}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM sessions WHERE token_hash=?", (token_digest(authorization[7:].strip()),))
+        await conn.commit()
+    return {"logged_out": True}
+
+@app.get("/admin/users", dependencies=[Depends(require_admin)])
+async def admin_users():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute("""SELECT u.id,u.username,u.role,u.status,u.quota_requests,u.quota_tokens,u.created_at,
+            COUNT(DISTINCT v.id) requests,COALESCE(SUM(v.total_tokens),0) tokens
+            FROM users u LEFT JOIN usage v ON v.user_id=u.id GROUP BY u.id ORDER BY u.created_at DESC""")).fetchall()
+    return {"users": [dict(row) for row in rows]}
+
+@app.patch("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+async def update_user(user_id: str, body: "UserUpdate"):
+    updates, values = [], []
+    for field in ("status","role","quota_requests","quota_tokens"):
+        value = getattr(body, field)
+        if value is not None:
+            if field == "status" and value not in ("active","disabled"):
+                raise HTTPException(400, "status must be active or disabled")
+            if field == "role" and value not in ("user","admin"):
+                raise HTTPException(400, "role must be user or admin")
+            if field.startswith("quota_") and value < 0:
+                raise HTTPException(400, "quota values cannot be negative")
+            updates.append(field+"=?")
+            values.append(value)
+    if not updates:
+        raise HTTPException(400, "No changes supplied")
+    values.append(user_id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("UPDATE users SET "+", ".join(updates)+" WHERE id=?", values)
+        await conn.commit()
+    if not cur.rowcount:
+        raise HTTPException(404, "User not found")
+    return {"updated": True}
+
+@app.delete("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+async def delete_user(user_id: str):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        row = await (await conn.execute("SELECT role FROM users WHERE id=?", (user_id,))).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        if row[0] == "admin":
+            count = (await (await conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'")).fetchone())[0]
+            if count <= 1:
+                raise HTTPException(400, "Cannot delete the last active administrator")
+        await conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        await conn.commit()
+    return {"deleted": True}
+
+@app.get("/admin/conversations", dependencies=[Depends(require_admin)])
+async def admin_conversations():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute("""SELECT c.id,c.user_id,u.username,c.title,c.created_at,c.updated_at,
+            COUNT(m.id) message_count FROM conversations c JOIN users u ON u.id=c.user_id
+            LEFT JOIN messages m ON m.conversation_id=c.id GROUP BY c.id ORDER BY c.updated_at DESC LIMIT 500""")).fetchall()
+    return {"conversations": [dict(row) for row in rows]}
+
+@app.get("/admin/conversations/{conversation_id}", dependencies=[Depends(require_admin)])
+async def admin_conversation_detail(conversation_id: str):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute("""SELECT c.*,u.username FROM conversations c JOIN users u ON u.id=c.user_id WHERE c.id=?""",(conversation_id,))).fetchone()
+        if not row:
+            raise HTTPException(404, "Conversation not found")
+        messages = await (await conn.execute("SELECT role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at",(conversation_id,))).fetchall()
+    return {"conversation": dict(row), "messages": [dict(m) for m in messages]}
+
+@app.get("/conversations")
+async def my_conversations(user: dict = Depends(current_user)):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute("SELECT id,title,created_at,updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC",(user["id"],))).fetchall()
+    return {"conversations": [dict(row) for row in rows]}
+
+@app.post("/conversations")
+async def create_conversation(body: "ConversationCreate", user: dict = Depends(current_user)):
+    conversation_id, now = str(uuid.uuid4()), time.time()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("INSERT INTO conversations (id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
+            (conversation_id,user["id"],body.title,now,now))
+        await conn.commit()
+    return {"id": conversation_id, "title": body.title}
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, user: dict = Depends(current_user)):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute("SELECT * FROM conversations WHERE id=? AND user_id=?",(conversation_id,user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(404, "Conversation not found")
+        messages = await (await conn.execute("SELECT role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at",(conversation_id,))).fetchall()
+    return {"conversation": dict(row), "messages": [dict(m) for m in messages]}
+
+@app.post("/conversations/{conversation_id}/messages")
+async def save_message(conversation_id: str, body: "MessageCreate", user: dict = Depends(current_user)):
+    if body.role not in ("user","assistant","system"):
+        raise HTTPException(400, "Invalid message role")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        row = await (await conn.execute("SELECT id FROM conversations WHERE id=? AND user_id=?",(conversation_id,user["id"]))).fetchone()
+        if not row:
+            raise HTTPException(404, "Conversation not found")
+        await conn.execute("INSERT INTO messages (id,conversation_id,role,content,created_at) VALUES (?,?,?,?,?)",
+            (str(uuid.uuid4()),conversation_id,body.role,body.content,time.time()))
+        await conn.execute("UPDATE conversations SET updated_at=? WHERE id=?",(time.time(),conversation_id))
+        await conn.commit()
+    return {"saved": True}
+
 async def require_admin(x_admin_key: str | None = Header(default=None)):
     if not x_admin_key or not ADMIN_API_KEY or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(401, "Invalid admin key")
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=12, max_length=256)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class UserUpdate(BaseModel):
+    status: str | None = None
+    role: str | None = None
+    quota_requests: int | None = None
+    quota_tokens: int | None = None
+
+class ConversationCreate(BaseModel):
+    title: str = Field(default="New conversation", min_length=1, max_length=120)
+
+class MessageCreate(BaseModel):
+    role: str
+    content: str = Field(min_length=1, max_length=100000)
 
 class KeyCreate(BaseModel):
     provider: str
