@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = os.getenv("DATABASE_PATH", str(ROOT / "data" / "router.db"))
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-this-to-a-long-random-secret")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "90"))
 MAX_ATTEMPTS = max(1, int(os.getenv("MAX_KEY_ATTEMPTS", "20")))
 COOLDOWN = max(5, int(os.getenv("COOLDOWN_SECONDS", "60")))
@@ -76,6 +76,8 @@ async def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if len(ADMIN_API_KEY) < 32:
+        raise RuntimeError("Set ADMIN_API_KEY to a random secret with at least 32 characters.")
     get_cipher()
     await init_db()
     yield
