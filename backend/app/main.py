@@ -125,6 +125,18 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Set ADMIN_API_KEY (32+ chars) or ADMIN_USERNAME and ADMIN_PASSWORD (12+ chars).")
     get_cipher()
     await init_db()
+    if ADMIN_USERNAME and ADMIN_PASSWORD:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            row = await (await conn.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,))).fetchone()
+            if row:
+                await conn.execute("UPDATE users SET password_hash=?,role='admin',status='active' WHERE username=?",
+                    (password_hash(ADMIN_PASSWORD), ADMIN_USERNAME))
+            else:
+                await conn.execute("""INSERT INTO users
+                    (id,username,password_hash,role,status,quota_requests,quota_tokens,created_at)
+                    VALUES (?,?,?,'admin','active',0,0,?)""",
+                    (str(uuid.uuid4()), ADMIN_USERNAME, password_hash(ADMIN_PASSWORD), time.time()))
+            await conn.commit()
     yield
 
 app = FastAPI(title="LLM Multi-Key Router", version="0.1.0", lifespan=lifespan)
@@ -338,10 +350,6 @@ async def save_message(conversation_id: str, body: "MessageCreate", user: dict =
         await conn.commit()
     return {"saved": True}
 
-async def require_admin(x_admin_key: str | None = Header(default=None)):
-    if not x_admin_key or not ADMIN_API_KEY or x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(401, "Invalid admin key")
-
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=12, max_length=256)
@@ -379,17 +387,17 @@ class ChatRequest(BaseModel):
 def mask_secret(secret: str) -> str:
     return "••••••••" + secret[-4:]
 
-async def log_usage(provider: str, model: str, key_id: str | None, latency: int, success: bool, status: int | None, usage: dict | None = None):
+async def log_usage(provider: str, model: str, key_id: str | None, latency: int, success: bool, status: int | None, usage: dict | None = None, user_id: str | None = None):
     usage = usage or {}
     input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or usage.get("promptTokenCount") or 0)
     output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or usage.get("candidatesTokenCount") or 0)
     total_tokens = int(usage.get("total_tokens") or usage.get("totalTokenCount") or (input_tokens + output_tokens))
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("""INSERT INTO usage
-          (id,provider,model,key_id,latency_ms,success,status_code,created_at,input_tokens,output_tokens,total_tokens)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+          (id,provider,model,key_id,latency_ms,success,status_code,created_at,input_tokens,output_tokens,total_tokens,user_id)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(uuid.uuid4()), provider, model, key_id, latency, int(success), status, time.time(),
-             input_tokens, output_tokens, total_tokens))
+             input_tokens, output_tokens, total_tokens, user_id))
         await conn.commit()
 
 async def provider_config(provider: str) -> dict | None:
@@ -490,7 +498,7 @@ async def execute_provider(provider: str, key: str, payload: dict):
         raise HTTPException(400, f"Unknown provider: {provider}")
     if config["kind"] == "anthropic":
         return await call_anthropic(key, payload)
-    if PROVIDERS[provider]["kind"] == "gemini":
+    if config["kind"] == "gemini":
         return await call_gemini(key, payload)
     return await call_openai_compatible(provider, key, payload)
 
