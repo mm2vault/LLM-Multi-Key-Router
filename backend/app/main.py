@@ -297,6 +297,21 @@ async def update_user(user_id: str, body: UserUpdate):
         raise HTTPException(404, "User not found")
     return {"updated": True}
 
+class AdminPasswordReset(BaseModel):
+    password: str = Field(min_length=12, max_length=256)
+
+@app.patch("/admin/users/{user_id}/password", dependencies=[Depends(require_admin)])
+async def admin_reset_password(user_id: str, body: AdminPasswordReset):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+            (password_hash(body.password), user_id))
+        if cur.rowcount:
+            await conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await conn.commit()
+    if not cur.rowcount:
+        raise HTTPException(404, "User not found")
+    return {"password_reset": True, "sessions_revoked": True}
+
 @app.delete("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
 async def delete_user(user_id: str):
     async with aiosqlite.connect(DB_PATH) as conn:
@@ -341,6 +356,17 @@ async def admin_conversation_detail(conversation_id: str):
             raise HTTPException(404, "Conversation not found")
         messages = await (await conn.execute("SELECT role,content,created_at FROM messages WHERE conversation_id=? ORDER BY created_at",(conversation_id,))).fetchall()
     return {"conversation": dict(row), "messages": [dict(m) for m in messages]}
+
+@app.delete("/admin/conversations/{conversation_id}", dependencies=[Depends(require_admin)])
+async def admin_delete_conversation(conversation_id: str):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        row = await (await conn.execute("SELECT id FROM conversations WHERE id=?", (conversation_id,))).fetchone()
+        if not row:
+            raise HTTPException(404, "Conversation not found")
+        await conn.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+        await conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+        await conn.commit()
+    return {"deleted": True}
 
 @app.get("/conversations")
 async def my_conversations(user: dict = Depends(current_user)):
