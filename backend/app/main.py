@@ -312,6 +312,15 @@ async def delete_user(user_id: str):
         await conn.commit()
     return {"deleted": True}
 
+@app.get("/admin/usage", dependencies=[Depends(require_admin)])
+async def admin_usage():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        rows = await (await conn.execute("""SELECT v.id,v.provider,v.model,v.key_id,v.latency_ms,v.success,
+            v.status_code,v.created_at,v.input_tokens,v.output_tokens,v.total_tokens,v.user_id,u.username
+            FROM usage v LEFT JOIN users u ON u.id=v.user_id ORDER BY v.created_at DESC LIMIT 500""")).fetchall()
+    return {"usage": [dict(row) for row in rows]}
+
 @app.get("/admin/conversations", dependencies=[Depends(require_admin)])
 async def admin_conversations():
     async with aiosqlite.connect(DB_PATH) as conn:
