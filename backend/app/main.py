@@ -111,6 +111,10 @@ async def init_db() -> None:
           content TEXT NOT NULL, created_at REAL NOT NULL,
           FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         )""")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_events (
+          id TEXT PRIMARY KEY, ip TEXT NOT NULL, action TEXT NOT NULL, created_at REAL NOT NULL
+        )""")
         # Safe additive migrations for databases created by earlier versions.
         key_columns = {row[1] for row in await (await conn.execute("PRAGMA table_info(api_keys)")).fetchall()}
         if "limit_info" not in key_columns:
@@ -126,8 +130,9 @@ async def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if len(ADMIN_API_KEY) < 32 and (not ADMIN_USERNAME or len(ADMIN_PASSWORD) < 12):
-        raise RuntimeError("Set ADMIN_API_KEY (32+ chars) or ADMIN_USERNAME and ADMIN_PASSWORD (12+ chars).")
+    if (not ADMIN_USERNAME or ADMIN_USERNAME == "your-admin-username" or
+        len(ADMIN_PASSWORD) < 12 or ADMIN_PASSWORD.startswith("replace-with-")):
+        raise RuntimeError("Set a real ADMIN_USERNAME and a unique ADMIN_PASSWORD of at least 12 characters.")
     get_cipher()
     await init_db()
     if ADMIN_USERNAME and ADMIN_PASSWORD:
@@ -223,8 +228,20 @@ class MessageCreate(BaseModel):
     role: str
     content: str = Field(min_length=1, max_length=100000)
 
+async def enforce_auth_rate_limit(ip: str, action: str):
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM auth_events WHERE created_at<?", (now - 900,))
+        count = (await (await conn.execute("SELECT COUNT(*) FROM auth_events WHERE ip=? AND created_at>=?", (ip, now - 900))).fetchone())[0]
+        if count >= 10:
+            raise HTTPException(429, "Too many authentication attempts. Try again in 15 minutes.")
+        await conn.execute("INSERT INTO auth_events (id,ip,action,created_at) VALUES (?,?,?,?)",
+            (str(uuid.uuid4()), ip, action, now))
+        await conn.commit()
+
 @app.post("/auth/register")
-async def register(body: RegisterRequest):
+async def register(body: RegisterRequest, request: Request):
+    await enforce_auth_rate_limit(request.client.host if request.client else "unknown", "register")
     username = body.username.strip()
     if not username.replace("_", "").replace("-", "").isalnum() or len(username) < 3 or len(username) > 32:
         raise HTTPException(400, "Username must be 3-32 characters (letters, numbers, _ or -).")
@@ -245,7 +262,8 @@ async def register(body: RegisterRequest):
     return {"token": token, "user": {"id": user_id, "username": username, "role": "user"}}
 
 @app.post("/auth/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
+    await enforce_auth_rate_limit(request.client.host if request.client else "unknown", "login")
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         row = await (await conn.execute("SELECT * FROM users WHERE username=?", (body.username.strip(),))).fetchone()
