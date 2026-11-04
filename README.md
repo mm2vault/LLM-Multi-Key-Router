@@ -39,7 +39,7 @@ There is **no hard-coded number of keys per provider**. Add as many authorized k
 - Streaming/SSE is not implemented yet. Requests with `stream: true` are not streamed.
 - Token totals are based on upstream usage metadata. Provider quota/balance endpoints are not queried; rate-limit values appear only when the provider returns recognized response headers.
 - Custom providers currently need an OpenAI-compatible `/chat/completions` API. Anthropic/Gemini-specific adapters are available only for built-in providers.
-- Per-user quotas are lifetime counters at this stage, not daily/monthly billing periods. A value of `0` means unlimited.
+- Per-user quotas are lifetime counters at this stage, not daily/monthly billing periods. A value of `0` means unlimited. Chat also has a basic per-user 30-request/minute throttle.
 - Public registration is currently enabled. Add CAPTCHA/email verification, IP-based rate limiting, abuse detection, and operational monitoring before opening signup widely.
 - The app has no payment/billing system. Never treat token counters as provider invoices.
 - Cross-provider fallback is a basic attempt sequence; model identifiers and request parameters are not universally compatible between providers. Specify the provider and a model valid for that provider.
