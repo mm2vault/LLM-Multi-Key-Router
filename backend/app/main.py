@@ -348,10 +348,10 @@ async def admin_reset_password(user_id: str, body: AdminPasswordReset):
 @app.delete("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
 async def delete_user(user_id: str):
     async with aiosqlite.connect(DB_PATH) as conn:
-        row = await (await conn.execute("SELECT role FROM users WHERE id=?", (user_id,))).fetchone()
+        row = await (await conn.execute("SELECT role,status FROM users WHERE id=?", (user_id,))).fetchone()
         if not row:
             raise HTTPException(404, "User not found")
-        if row[0] == "admin":
+        if row[0] == "admin" and row[1] == "active":
             count = (await (await conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'")).fetchone())[0]
             if count <= 1:
                 raise HTTPException(400, "Cannot delete the last active administrator")
