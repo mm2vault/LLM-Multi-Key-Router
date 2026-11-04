@@ -20,7 +20,7 @@ export default function App(){
     const [k,s,p,u,cv,us]=await Promise.all([api('/admin/keys'),api('/admin/stats'),api('/admin/providers'),api('/admin/users'),api('/admin/conversations'),api('/admin/usage')]);
     setKeys(k.keys||[]);setStats(s);setCustomProviders(p.providers||[]);setUsers(u.users||[]);setConversations(cv.conversations||[]);setUsage(us.usage||[]);
    }else{
-    const [u,cv]=await Promise.all([api('/usage/me'),api('/conversations')]);setMyUsage(u);setConversations(cv.conversations||[]);
+    const [u,cv,p]=await Promise.all([api('/usage/me'),api('/conversations'),api('/v1/providers')]);setMyUsage(u);setConversations(cv.conversations||[]);setCustomProviders((p.providers||[]).filter(x=>!builtins.includes(x)).map(slug=>({slug,name:slug})));
    }
   }catch(e){setError(String(e));localStorage.removeItem('router_session');setSession('');setUser(null)}
  }
@@ -35,7 +35,7 @@ export default function App(){
  async function removeProvider(p){if(!confirm('Delete provider and its attached keys?'))return;try{await api('/admin/providers/'+p.id,{method:'DELETE'});await load()}catch(e){setError(String(e))}}
  async function changeUser(u){const action=prompt('Type: disable, enable, role-user, role-admin, or quota', 'quota');if(!action)return;let body={};if(action==='disable')body.status='disabled';else if(action==='enable')body.status='active';else if(action==='role-user')body.role='user';else if(action==='role-admin')body.role='admin';else if(action==='quota'){const rq=prompt('Request limit (0 = unlimited)',String(u.quota_requests));if(rq===null)return;const tq=prompt('Token limit (0 = unlimited)',String(u.quota_tokens));if(tq===null)return;body={quota_requests:Number(rq),quota_tokens:Number(tq)}}else return;try{await api('/admin/users/'+u.id,{method:'PATCH',body:JSON.stringify(body)});await load()}catch(e){setError(String(e))}}
  async function deleteUser(u){if(!confirm('Permanently delete '+u.username+' and their history?'))return;try{await api('/admin/users/'+u.id,{method:'DELETE'});await load()}catch(e){setError(String(e))}}
- async function openConversation(c){try{const d=user?.role==='admin'?await api('/admin/conversations/'+c.id):await api('/conversations/'+c.id);setOpenedConversation(d);setConversationId(c.id);setMessages(d.messages||[]);setTab('chat')}catch(e){setError(String(e))}}
+ async function openConversation(c){try{const d=user?.role==='admin'?await api('/admin/conversations/'+c.id):await api('/conversations/'+c.id);setOpenedConversation(d);setConversationId(c.id);setMessages(d.messages||[]);setTab(user?.role==='admin'?'conversations':'chat')}catch(e){setError(String(e))}}
  async function send(e){e.preventDefault();if(!input.trim()||busy||!session)return;const text=input.trim();const next=[...messages,{role:'user',content:text}];setMessages(next);setInput('');setBusy(true);setError('');
   try{
    let cid=conversationId;
