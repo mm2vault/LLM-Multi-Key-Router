@@ -13,6 +13,10 @@ There is **no hard-coded number of keys per provider**. Add as many authorized k
 
 ## Current capabilities
 - Add, list (masked), enable/disable, and delete provider keys
+- Register custom OpenAI-compatible providers by display name and HTTPS base URL, then attach one or more API keys
+- Persist provider definitions, labels, encrypted keys, cooldowns, and usage records in SQLite
+- Track input/output/total tokens when the upstream provider returns usage metadata
+- Capture common provider rate-limit response headers per key when supplied
 - Encrypt secrets at rest with Fernet
 - Select the least-recently-used eligible key
 - Retry other keys when a key is rate-limited, unavailable, or fails authentication
@@ -23,6 +27,8 @@ There is **no hard-coded number of keys per provider**. Add as many authorized k
 
 ## Important limitations (current starter release)
 - Streaming/SSE is not implemented yet. Requests with `stream: true` are not streamed.
+- Token totals are based on upstream usage metadata. Provider quota/balance endpoints are not queried; rate-limit values appear only when the provider returns recognized response headers.
+- Custom providers currently need an OpenAI-compatible `/chat/completions` API. Anthropic/Gemini-specific adapters are available only for the built-in providers.
 - The dashboard is an **admin key-management console**, not yet a public multi-user chat service. Do not expose it to the public internet as-is.
 - User registration, individual API tokens, per-user quotas, abuse controls, billing, and public signup are planned next.
 - Cross-provider fallback is a basic attempt sequence; model identifiers and request parameters are not universally compatible between providers. Specify the provider and a model valid for that provider for reliable results.
@@ -53,7 +59,27 @@ Health endpoint: http://localhost:8000/health
 
 ## API
 
-Add a key (admin only):
+Add a custom OpenAI-compatible provider (admin only):
+
+```http
+POST /admin/providers
+X-Admin-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{"name":"My Gateway","base_url":"https://api.example.com/v1"}
+```
+
+The response includes a provider slug. Add a key for that slug using the endpoint below:
+
+```http
+POST /admin/keys
+X-Admin-Key: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{"provider":"my-gateway","label":"My Gateway key 01","api_key":"<YOUR_PROVIDER_KEY>"}
+```
+
+Add a built-in provider key (admin only):
 
 ```http
 POST /admin/keys
