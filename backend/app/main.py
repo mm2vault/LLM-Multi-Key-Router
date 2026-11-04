@@ -219,7 +219,7 @@ class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=100000)
 
 @app.post("/auth/register")
-async def register(body: "RegisterRequest"):
+async def register(body: RegisterRequest):
     username = body.username.strip()
     if not username.replace("_", "").replace("-", "").isalnum() or len(username) < 3 or len(username) > 32:
         raise HTTPException(400, "Username must be 3-32 characters (letters, numbers, _ or -).")
@@ -240,7 +240,7 @@ async def register(body: "RegisterRequest"):
     return {"token": token, "user": {"id": user_id, "username": username, "role": "user"}}
 
 @app.post("/auth/login")
-async def login(body: "LoginRequest"):
+async def login(body: LoginRequest):
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         row = await (await conn.execute("SELECT * FROM users WHERE username=?", (body.username.strip(),))).fetchone()
@@ -274,7 +274,7 @@ async def admin_users():
     return {"users": [dict(row) for row in rows]}
 
 @app.patch("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
-async def update_user(user_id: str, body: "UserUpdate"):
+async def update_user(user_id: str, body: UserUpdate):
     updates, values = [], []
     for field in ("status","role","quota_requests","quota_tokens"):
         value = getattr(body, field)
@@ -310,7 +310,6 @@ async def delete_user(user_id: str):
         await conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await conn.execute("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id=?)", (user_id,))
         await conn.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
-        await conn.execute("UPDATE usage SET user_id=NULL WHERE user_id=?", (user_id,))
         await conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         await conn.commit()
     return {"deleted": True}
@@ -351,7 +350,7 @@ async def my_conversations(user: dict = Depends(current_user)):
     return {"conversations": [dict(row) for row in rows]}
 
 @app.post("/conversations")
-async def create_conversation(body: "ConversationCreate", user: dict = Depends(current_user)):
+async def create_conversation(body: ConversationCreate, user: dict = Depends(current_user)):
     conversation_id, now = str(uuid.uuid4()), time.time()
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("INSERT INTO conversations (id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)",
@@ -370,7 +369,7 @@ async def get_conversation(conversation_id: str, user: dict = Depends(current_us
     return {"conversation": dict(row), "messages": [dict(m) for m in messages]}
 
 @app.post("/conversations/{conversation_id}/messages")
-async def save_message(conversation_id: str, body: "MessageCreate", user: dict = Depends(current_user)):
+async def save_message(conversation_id: str, body: MessageCreate, user: dict = Depends(current_user)):
     if body.role not in ("user","assistant","system"):
         raise HTTPException(400, "Invalid message role")
     async with aiosqlite.connect(DB_PATH) as conn:
